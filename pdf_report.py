@@ -1,6 +1,21 @@
 from reportlab.lib.pagesizes import LETTER
+import os
+import logging
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, ListFlowable, ListItem, Image
+
+# Import news fetcher
+from news_fetcher import get_company_news
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, ListFlowable, ListItem
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, ListFlowable, ListItem, Image
+import matplotlib
+import feedparser
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from reportlab.lib import colors
 import os
 import logging
@@ -10,6 +25,94 @@ import shutil
 
 logger = logging.getLogger(__name__)
 
+def generate_llm_output(valuations: dict, risks: list, recommendation: str, comparison: dict) -> str:
+    """Generate a concise, insight‑driven analyst commentary.
+
+    The function synthesizes peer‑relative performance, cash‑flow health, valuation stance, and material risks into a 3‑5 sentence paragraph that aids investment decisions.
+    """
+    # Extract comparison data
+    annual_df = comparison.get('annual')
+    ticker = comparison.get('target', '')
+    peer_cols = [c for c in (annual_df.columns if annual_df is not None else []) if c != ticker]
+
+    # ----- Peer performance assessment -----
+    performance_phrases = []
+    if annual_df is not None and not annual_df.empty and ticker in annual_df.columns and peer_cols:
+        for metric, label in [
+            ("revenue_growth_yoy", "revenue growth"),
+            ("ebit_margin", "EBIT margin"),
+            ("roe", "ROE")
+        ]:
+            if metric in annual_df.index:
+                company_val = annual_df.loc[metric, ticker]
+                peer_median = annual_df.loc[metric, peer_cols].dropna().median()
+                if pd.notna(company_val) and pd.notna(peer_median):
+                    if company_val > peer_median:
+                        performance_phrases.append(f"outperforms peers on {label}")
+                    elif company_val < peer_median:
+                        performance_phrases.append(f"lags peers on {label}")
+    # Build a fluid summary of peer results
+    if performance_phrases:
+        perf_summary = ", ".join(performance_phrases)
+    else:
+        perf_summary = "shows mixed performance versus peers"
+
+    # ----- Valuation and cash‑flow -----
+    valuation_status = valuations.get('valuation_status', 'N/A').lower()
+    fcf = valuations.get('free_cash_flow')
+    fcf_desc = "generates positive free cash flow" if fcf and fcf > 0 else "has weak or negative free cash generation"
+
+    # ----- Risk framing -----
+    risk_count = len(risks)
+    risk_sentence = f"{risk_count} risk factor{'s' if risk_count != 1 else ''} identified" if risk_count else "no material financial risks flagged"
+    # Optionally highlight the most salient risk (first one)
+    if risks:
+        risk_sentence += f", notably {risks[0].lower()}"
+
+    # ----- Compose final commentary (3‑5 sentences) -----
+    sentences = [
+        f"The company {perf_summary}.",
+        f"It {fcf_desc}, supporting operational flexibility.",
+        f"From a valuation viewpoint, the stock is considered {valuation_status}.",
+        f"{risk_sentence.capitalize()}, suggesting investors weigh these factors against the valuation outlook."
+    ]
+    # Trim any empty sentences and join
+    return " ".join(filter(None, sentences))
+    """Generate a concise analyst‑style commentary.
+
+    Builds a 3‑5 line paragraph summarising performance relative to peers,
+    valuation outlook, and key risks without repeating raw numbers or using hardcoded phrases.
+    """
+    annual_df = comparison.get('annual')
+    ticker = comparison.get('target', '')
+    peer_cols = [c for c in annual_df.columns if c != ticker] if annual_df is not None else []
+    
+    # Determine peer-relative performance dynamically
+    performance_phrases = []
+    if annual_df is not None and not annual_df.empty and ticker in annual_df.columns and peer_cols:
+        for metric, desc in [("revenue_growth_yoy", "revenue expansion"), ("ebit_margin", "operating profitability"), ("roe", "return on equity")]:
+            if metric in annual_df.index:
+                val = annual_df.loc[metric, ticker]
+                peer_median = annual_df.loc[metric, peer_cols].dropna().median()
+                if pd.notna(val) and pd.notna(peer_median):
+                    status = "outperforming" if val > peer_median else "underperforming"
+                    performance_phrases.append(f"{status} peers in {desc}")
+    
+    perf_summary = ", while ".join(performance_phrases) if performance_phrases else "showing mixed financial performance relative to peers"
+    
+    valuation_status = valuations.get('valuation_status', 'N/A').lower()
+    fcf = valuations.get('free_cash_flow')
+    fcf_desc = "generating positive free cash flow" if fcf and fcf > 0 else "exhibiting weak or negative cash generation"
+    
+    sentences = [
+        f"The company demonstrates peer-relative traits, {perf_summary}.",
+        f"Additionally, the firm is {fcf_desc}, which influences operational flexibility.",
+        f"From a valuation perspective, the stock is currently classified as {valuation_status}.",
+        f"With {len(risks)} financial risk factor(s) identified, investors should weigh this valuation status against prevailing risks."
+    ]
+    return " ".join(sentences)
+
+
 def generate_pdf_report(
     ticker: str,
     comparison: dict,
@@ -18,7 +121,10 @@ def generate_pdf_report(
     recommendation: str,
     justification: str,
     news: list,
+    news_feed_url: str = None,
     output_path: str = None,
+    llm_commentary: str = "",
+    warnings: list = None,
 ) -> str:
     """Create a clean, premium PDF report structured exactly as required.
 
@@ -129,6 +235,53 @@ def generate_pdf_report(
     elements.append(Paragraph(f"FINANCIAL ANALYSIS REPORT: {ticker}", title_style))
     elements.append(Spacer(1, 10))
 
+
+
+    # --- WARNINGS BANNER (IF ANOMALIES DETECTED) ---
+    if warnings:
+        elements.append(Paragraph("WARNING: POTENTIAL DATA ANOMALIES", h2_style))
+        for w in warnings:
+            elements.append(Paragraph(f"<font color='#C53030'><b>Warning:</b> {w}</font>", body_style))
+        elements.append(Spacer(1, 10))
+
+    # --- SECTION 1: ONE-PAGE SUMMARY ---
+    elements.append(Paragraph("ONE-PAGE SUMMARY", h2_style))
+    summary_items = []
+    
+    # Calculate strengths relative to peer medians
+    strengths = []
+    annual_df = comparison.get("annual")
+    if annual_df is not None and not annual_df.empty and ticker in annual_df.columns:
+        peer_cols = [c for c in annual_df.columns if c != ticker]
+        if peer_cols:
+            metrics_to_compare = {
+                "revenue_growth_yoy": "Revenue Growth (YoY)",
+                "ebit_margin": "EBIT Margin",
+                "net_profit_margin": "Net Profit Margin",
+                "roe": "ROE",
+                "fcf_margin": "FCF Margin"
+            }
+            for m_key, m_name in metrics_to_compare.items():
+                if m_key in annual_df.index:
+                    target_val = annual_df.loc[m_key, ticker]
+                    peer_vals = annual_df.loc[m_key, peer_cols].dropna()
+                    if pd.notna(target_val) and not peer_vals.empty:
+                        peer_median = peer_vals.median()
+                        if target_val > peer_median:
+                            strengths.append(f"Outperforming peers on {m_name} ({target_val*100:.2f}% vs peer median {peer_median*100:.2f}%)")
+
+    # Recommendation and valuation status (highlighted in red)
+    summary_items.append(ListItem(Paragraph(f"<font color='#B22222'>Recommendation: {recommendation}</font>", body_style), bulletColor=colors.HexColor('#B22222')))
+    summary_items.append(ListItem(Paragraph(f"<font color='#B22222'>Valuation status: {valuations.get('valuation_status', 'N/A')}</font>", body_style), bulletColor=colors.HexColor('#B22222')))
+    # Strengths (green)
+    for s in strengths:
+        summary_items.append(ListItem(Paragraph(f"<font color='#228B22'>Strength: {s}</font>", body_style), bulletColor=colors.HexColor('#228B22')))
+    # Risks (up to 3, red)
+    for r in risks[:3]:
+        summary_items.append(ListItem(Paragraph(f"<font color='#B22222'>Risk: {r}</font>", body_style), bulletColor=colors.HexColor('#B22222')))
+    elements.append(ListFlowable(summary_items, bulletType='bullet'))
+    elements.append(Spacer(1, 10))
+
     # --- SECTION 1: METRICS ---
     elements.append(Paragraph("1. FINANCIAL PERFORMANCE & PEER COMPARISON", h1_style))
     
@@ -175,7 +328,70 @@ def generate_pdf_report(
         ]))
         return [Paragraph(title, h2_style), Spacer(1, 4), tbl, Spacer(1, 10)]
 
+    def create_bar_chart(metric, df, ticker):
+        """Generate a bar chart PNG. 
+        Supports DataFrames where metrics are rows or columns.
+        """
+        # Ensure charts directory exists
+        charts_dir = os.path.join(os.getcwd(), "charts")
+        os.makedirs(charts_dir, exist_ok=True)
+        # Check if metric is index (rows) or columns
+        if metric in df.index:
+            values = df.loc[metric]
+        elif metric in df.columns:
+            values = df[metric]
+        else:
+            return None
+        plt.figure(figsize=(6, 3))
+        # Drop NaN values for clean plotting
+        plot_values = values.dropna()
+        bars = plt.bar(plot_values.index.astype(str), plot_values.values, color="#1A365D")
+        plt.title(f"{metric.replace('_', ' ').title()} Comparison")
+        plt.xticks(rotation=45, ha='right')
+        
+        # Apply log scale for absolute currencies (revenue, net income, FCF) if all values are positive
+        if metric in ["revenue", "net_income", "free_cash_flow"] and not plot_values.empty:
+            if (plot_values > 0).all():
+                plt.yscale('log')
+                plt.ylabel("Value (Log Scale)")
+            else:
+                plt.ylabel("Value")
+        else:
+            plt.ylabel("Percentage" if "margin" in metric or "growth" in metric or "roe" in metric else "Value")
+
+        for bar in bars:
+            height = bar.get_height()
+            if pd.notna(height):
+                # Annotate values cleanly
+                if "margin" in metric or "growth" in metric or "roe" in metric:
+                    ann_text = f"{height*100:.1f}%" if abs(height) <= 1.0 else f"{height:.1f}%"
+                elif abs(height) >= 1e9:
+                    ann_text = f"${height/1e9:.1f}B"
+                elif abs(height) >= 1e6:
+                    ann_text = f"${height/1e6:.1f}M"
+                else:
+                    ann_text = f"{height:.1f}"
+                plt.annotate(ann_text, xy=(bar.get_x() + bar.get_width() / 2, height),
+                             xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=8)
+                             
+        chart_path = os.path.join(charts_dir, f"{ticker}_{metric}.png")
+        plt.tight_layout()
+        plt.savefig(chart_path, dpi=150)
+        plt.close()
+        return chart_path
+
     annual_df = comparison.get("annual")
+
+    def fetch_company_news(company_name: str, limit: int = 5) -> list:
+        """Fetch top news headlines for the company using the news_fetcher module."""
+        try:
+            news_items = get_company_news(company_name)
+            # Trim to limit
+            return news_items[:limit]
+        except Exception as e:
+            logger.error(f"Failed to fetch news for {company_name}: {e}")
+            return []
+
     quarterly_df = comparison.get("quarterly")
     
     if annual_df is not None and not annual_df.empty:
@@ -184,85 +400,83 @@ def generate_pdf_report(
         elements.extend(df_to_table(quarterly_df, "Quarterly Performance Stats"))
 
     # --- SECTION 2: VALUATION ---
-    elements.append(Paragraph("2. VALUATION SUMMARY", h1_style))
-    
-    # Intrinsic Valuations Table
+    # Insert bar charts for key metrics after tables
+    chart_metrics = ["revenue", "net_income", "roe"]
+    for metric in chart_metrics:
+        # Choose dataframe where the metric exists as a column
+        chart_df = None
+        if annual_df is not None and metric in annual_df.index:
+            chart_df = annual_df
+        elif quarterly_df is not None and metric in quarterly_df.index:
+            chart_df = quarterly_df
+        if chart_df is not None:
+            chart_path = create_bar_chart(metric, chart_df, ticker)
+            if chart_path and os.path.exists(chart_path):
+                elements.append(Paragraph(f"{metric.replace('_', ' ').title()} Comparison Chart", h2_style))
+                elements.append(Spacer(1, 4))
+                img = Image(chart_path, width=500, height=300)
+                elements.append(img)
+                elements.append(Spacer(1, 10))
+
+    # --- SECTION 2: VALUATION SUMMARY ---
+    # One Page Summary generation (top priority)
+    # Prepare metrics and strengths
+    metrics = {}
+    # Example strengths extraction (use placeholders if not available)
+    strengths = []
+    if annual_df is not None:
+        # Example: highest revenue growth
+        try:
+            rev_growth = annual_df.loc['revenue_growth_yoy']
+            top_peer = rev_growth.idxmax()
+            strengths.append(f"Strong revenue growth YoY compared to peers, leading with {top_peer}")
+        except Exception as e:
+            logger.error(f"Failed to compute revenue growth strength: {e}")
+    elements.append(Paragraph("2. VALUATION SUMMARY (DCF-BASED)", h1_style))
+
     val_rows = [
-        ["Intrinsic Model", "Estimated Value"],
-        ["Discounted Cash Flow (DCF)", f"${valuations.get('dcf'):,.2f}" if isinstance(valuations.get('dcf'), (int, float)) else "N/A"],
-        ["Benjamin Graham Formula", f"${valuations.get('graham'):,.2f}" if isinstance(valuations.get('graham'), (int, float)) else "N/A"],
-        ["Graham Number", f"${valuations.get('graham_number'):,.2f}" if isinstance(valuations.get('graham_number'), (int, float)) else "N/A"],
+        ["DCF Estimated Value", f"${valuations.get('dcf'):,.2f}" if isinstance(valuations.get('dcf'), (int, float)) else "N/A"],
         ["Current Market Price", f"${valuations.get('market_price'):,.2f}" if isinstance(valuations.get('market_price'), (int, float)) else "N/A"],
         ["Valuation Status", str(valuations.get("valuation_status", "N/A"))]
     ]
     
-    val_table = Table(val_rows, hAlign='LEFT')
+    val_table = Table(val_rows, hAlign='LEFT', colWidths=[200, 150])
     val_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EDF2F7")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
         ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTNAME", (0, 5), (1, 5), "Helvetica-Bold"), # Bold for status row
-        ("BACKGROUND", (0, 5), (-1, 5), colors.HexColor("#F7FAFC")),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"), # Labels in bold
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica"),      # Values in regular font
+        ("FONTNAME", (1, 2), (1, 2), "Helvetica-Bold"),  # Bold for status value
+        ("BACKGROUND", (0, 2), (-1, 2), colors.HexColor("#F7FAFC")), # Highlight status row
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
     ]))
     elements.append(val_table)
     elements.append(Spacer(1, 10))
 
-    # --- SECTION 3: RELATIVE VALUATION ---
-    elements.append(Paragraph("3. RELATIVE VALUATION SUMMARY", h1_style))
-    rel_rows = [
-        ["Relative Metric", "Value", "Threshold/Benchmark"],
-        ["PEG Ratio", f"{valuations.get('peg'):,.2f}" if isinstance(valuations.get('peg'), (int, float)) else "N/A", "Cheap if < 1.5"],
-        ["EV/EBITDA", f"{valuations.get('ev_ebitda'):,.2f}" if isinstance(valuations.get('ev_ebitda'), (int, float)) else "N/A", "Cheap if < 15.0"],
-        ["Price-to-Free-Cash-Flow (P/FCF)", f"{valuations.get('p_fcf'):,.2f}" if isinstance(valuations.get('p_fcf'), (int, float)) else "N/A", "Cheap if < 20.0"],
-        ["Short Interpretation", str(valuations.get("relative_interpretation", "N/A")).upper(), "Based on valuation benchmarks"]
-    ]
-    rel_table = Table(rel_rows, hAlign='LEFT')
-    rel_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EDF2F7")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E0")),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTNAME", (0, 4), (1, 4), "Helvetica-Bold"),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    elements.append(rel_table)
+    # --- SECTION 3: NEWS ---
+    elements.append(Paragraph("3. RECENT COMPANY NEWS HEADLINES", h1_style))
+    # Fetch news relevant to the target ticker
+    news_items = get_company_news(ticker)
+    static_news = [item.get('title', 'No title') for item in news_items[:5]]
+    for idx, title in enumerate(static_news, 1):
+        news_text = f"<b>{idx}. {title}</b>"
+        elements.append(Paragraph(news_text, body_style))
+        elements.append(Spacer(1, 6))
+    elements.append(Spacer(1, 10))
     elements.append(Spacer(1, 10))
 
-    # --- SECTION 4: NEWS ---
-    elements.append(Paragraph("4. RECENT COMPANY NEWS HEADLINES", h1_style))
-    if news:
-        for idx, item in enumerate(news[:5], 1):
-            title = item.get("title") or "No Title"
-            publisher = item.get("publisher") or "Unknown Publisher"
-            pub_date = item.get("pubDate") or ""
-            link = item.get("link")
-            if link and (link.startswith("http://") or link.startswith("https://")):
-                news_text = f"<b>{idx}. <a href='{link}' color='#1A365D'>{title}</a></b><br/><font color='#718096'>via {publisher} | {pub_date}</font>"
-            else:
-                news_text = f"<b>{idx}. {title}</b><br/><font color='#718096'>via {publisher} | {pub_date}</font>"
-            elements.append(Paragraph(news_text, body_style))
-            elements.append(Spacer(1, 6))
-    else:
-        elements.append(Paragraph("No recent news headlines available.", body_style))
-    elements.append(Spacer(1, 10))
-
-    # --- SECTION 5: RISKS ---
-    elements.append(Paragraph("5. FINANCIAL RISK ANALYSIS", h1_style))
+    # --- SECTION 4: RISKS ---
+    elements.append(Paragraph("4. FINANCIAL RISK ANALYSIS", h1_style))
     if risks:
         risk_items = [ListItem(Paragraph(r, body_style), leftIndent=15, bulletOffsetY=-2) for r in risks]
-        elements.append(ListFlowable(risk_items, bulletType='bullet', start='circle', bulletColor=colors.HexColor("#E53E3E")))
+        elements.append(ListFlowable(risk_items, bulletType='bullet', bulletColor=colors.HexColor('#E53E3E')))
     else:
         elements.append(Paragraph("No significant financial risks detected.", body_style))
     elements.append(Spacer(1, 12))
 
-    # --- SECTION 6: RECOMMENDATION ---
-    elements.append(Paragraph("6. FINAL DETERMINISTIC RECOMMENDATION", h1_style))
+    # --- SECTION 5: RECOMMENDATION ---
+    elements.append(Paragraph("5. FINAL DETERMINISTIC RECOMMENDATION", h1_style))
     
     # Banner/Box for recommendation
     bg_color = colors.HexColor("#FED7D7") if recommendation == "AVOID" else colors.HexColor("#C6F6D5") if recommendation == "BUY" else colors.HexColor("#FEFCBF")
@@ -282,6 +496,10 @@ def generate_pdf_report(
     elements.append(Spacer(1, 8))
     
     elements.append(Paragraph(f"<b>Justification:</b> {justification}", body_style))
+    # LLM OUTPUT SECTION (added at end of report)
+    elements.append(Paragraph("LLM OUTPUT", h1_style))
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(llm_commentary, body_style))
 
     # Build document
     try:

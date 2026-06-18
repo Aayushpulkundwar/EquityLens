@@ -16,27 +16,26 @@ def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator / clean_denom
 
 def calculate_time_based_growth(df: pd.DataFrame, target_col: str, months_offset: int, max_days_diff: int) -> pd.Series:
+    """
+    Compute period‑over‑period growth for *target_col*.
+    For each row date, we look back *months_offset* months, find the nearest index
+    within *max_days_diff* days, and calculate (current / prior) - 1.
+    Returns a Series aligned with ``df.index`` containing ``NaN`` where no suitable prior
+    observation exists.
+    """
     growth_series = pd.Series(index=df.index, dtype=float)
     if df.empty or target_col not in df.columns:
         return growth_series
-        
-    for date in df.index:
-        # Calculate the historical date we want to compare against
-        target_date = date - pd.DateOffset(months=months_offset)
-        # Find the closest date index
-        diffs = abs(df.index - target_date)
-        if len(diffs) > 0:
-            closest_idx = diffs.argmin()
-            closest_date = df.index[closest_idx]
-            
-            # Ensure the closest date is within acceptable bounds
-            if diffs[closest_idx] <= pd.Timedelta(days=max_days_diff):
-                val_current = df.loc[date, target_col]
-                val_prior = df.loc[closest_date, target_col]
-                
-                if pd.notna(val_current) and pd.notna(val_prior) and val_prior != 0:
-                    growth_series.loc[date] = (val_current / val_prior) - 1.0
-                    
+    for current_date in df.index:
+        target_date = current_date - pd.DateOffset(months=months_offset)
+        # Find nearest date using pandas get_indexer with nearest method
+        idx = df.index.get_indexer([target_date], method='nearest')[0]
+        nearest_date = df.index[idx]
+        if abs((nearest_date - target_date).days) <= max_days_diff:
+            val_current = df.at[current_date, target_col]
+            val_prior = df.at[nearest_date, target_col]
+            if pd.notna(val_current) and pd.notna(val_prior) and val_prior != 0:
+                growth_series.at[current_date] = (val_current / val_prior) - 1.0
     return growth_series
 
 def compute_financial_metrics(processed_data: Dict[str, pd.DataFrame]) -> Optional[Dict[str, pd.DataFrame]]:
@@ -87,7 +86,7 @@ def compute_financial_metrics(processed_data: Dict[str, pd.DataFrame]) -> Option
     return enriched_data
 
 def format_latest_metrics_summary(enriched_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    summary = {"annual": {}, "quarterly": {}}
+    summary = {"annual": {}, "quarterly": {}, "warnings": []}
     
     for timeframe in ["annual", "quarterly"]:
         df = enriched_data.get(timeframe)
@@ -122,6 +121,29 @@ def format_latest_metrics_summary(enriched_data: Dict[str, pd.DataFrame]) -> Dic
         
         if timeframe == "quarterly" and "roe_annualized" in row:
             metrics["roe_annualized"] = clean_val(row.get("roe_annualized"))
+            
+        # Anomaly Validation
+        net_margin = metrics.get("net_profit_margin")
+        roe = metrics.get("roe")
+        roe_ann = metrics.get("roe_annualized")
+        
+        if net_margin is not None and net_margin > 0.60:
+            summary["warnings"].append(
+                f"Possible anomaly detected: {timeframe.title()} Net Profit Margin is {net_margin*100:.2f}% (> 60%). Excluded from decision logic."
+            )
+            metrics["net_profit_margin"] = None
+            
+        if roe is not None and roe > 1.00:
+            summary["warnings"].append(
+                f"Possible anomaly detected: {timeframe.title()} ROE is {roe*100:.2f}% (> 100%). Excluded from decision logic."
+            )
+            metrics["roe"] = None
+            
+        if roe_ann is not None and roe_ann > 1.00:
+            summary["warnings"].append(
+                f"Possible anomaly detected: {timeframe.title()} Annualized ROE is {roe_ann*100:.2f}% (> 100%). Excluded from decision logic."
+            )
+            metrics["roe_annualized"] = None
             
         summary[timeframe] = metrics
         

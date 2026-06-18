@@ -1,7 +1,9 @@
 import os
+import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import pandas as pd
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -128,44 +130,23 @@ def generate_fallback_report(
     
     # 4. VALUATION SUMMARY
     dcf = vals_for_display.get("dcf")
-    graham = vals_for_display.get("graham")
-    graham_num = vals_for_display.get("graham_number")
     price = vals_for_display.get("market_price")
     status = vals_for_display.get("valuation_status")
-    
+
     dcf_str = f"${dcf:,.2f}" if isinstance(dcf, (int, float)) else "N/A"
-    graham_str = f"${graham:,.2f}" if isinstance(graham, (int, float)) else "N/A"
-    graham_num_str = f"${graham_num:,.2f}" if isinstance(graham_num, (int, float)) else "N/A"
     price_str = f"${price:,.2f}" if isinstance(price, (int, float)) else "N/A"
-    
+
     report_lines.extend([
-        "4. VALUATION SUMMARY",
+        "4. VALUATION SUMMARY (DCF-BASED)",
         f"   - DCF Estimated Value: {dcf_str}",
-        f"   - Graham Formula Value: {graham_str}",
-        f"   - Graham Number: {graham_num_str}",
         f"   - Market Price: {price_str}",
         f"   - Valuation Status: {status}",
-        ""
+        "",
     ])
     
     # 5. RELATIVE VALUATION
-    peg = vals_for_display.get("peg")
-    ev_ebitda = vals_for_display.get("ev_ebitda")
-    p_fcf = vals_for_display.get("p_fcf")
-    interpretation = vals_for_display.get("relative_interpretation")
-    
-    peg_str = f"{peg:.2f}" if isinstance(peg, (int, float)) else "N/A"
-    ev_ebitda_str = f"{ev_ebitda:.2f}" if isinstance(ev_ebitda, (int, float)) else "N/A"
-    p_fcf_str = f"{p_fcf:.2f}" if isinstance(p_fcf, (int, float)) else "N/A"
-    
-    report_lines.extend([
-        "5. RELATIVE VALUATION",
-        f"   - PEG Ratio: {peg_str}",
-        f"   - EV/EBITDA: {ev_ebitda_str}",
-        f"   - Price-to-Free-Cash-Flow (P/FCF): {p_fcf_str}",
-        f"   - Short interpretation: {interpretation}",
-        ""
-    ])
+    # (Removed per user request – only DCF model retained)
+    # No relative valuation metrics are displayed.
     
     # 6. RISK ANALYSIS
     report_lines.append("6. RISK ANALYSIS")
@@ -224,106 +205,197 @@ def generate_financial_report(target_ticker: str, comparison_data: Dict[str, Any
                 current_price = float(h['Close'].iloc[-1])
         except Exception:
             current_price = None
-
     # Compute valuations
     if enriched_metrics:
         val_inputs = valuation_engine.prepare_valuation_inputs(metadata, enriched_metrics)
-        dcf_val = valuation_engine.calculate_dcf(val_inputs.get("fcf_series"))
-        
+        dcf_val = valuation_engine.dcf_valuation(val_inputs.get("fcf_series"))
         shares = info.get("sharesOutstanding")
         if dcf_val is not None and shares and shares > 0:
             dcf_val = dcf_val / shares
-            
-        pe_ratio = val_inputs.get("pe_ratio")
-        eps = val_inputs.get("eps")
-        book_value = val_inputs.get("book_value")
-        
-        growth_rate = val_inputs.get("revenue_growth_yoy")
-        g_rate_pct = growth_rate * 100 if growth_rate is not None else 0.0
-        
-        graham_val = valuation_engine.calculate_benjamin_graham(
-            earnings_growth_rate=g_rate_pct,
-            eps=eps,
-            book_value=book_value
-        )
-        
-        graham_num = valuation_engine.calculate_graham_number(
-            eps=eps,
-            book_value_per_share=book_value
-        )
-        
-        gordon_val = valuation_engine.calculate_gordon_growth(val_inputs.get("dividend"))
-        
-        peg_val = valuation_engine.calculate_peg_ratio(
-            pe_ratio=pe_ratio,
-            earnings_growth_rate=val_inputs.get("revenue_growth_yoy")
-        )
-        
-        ev_ebitda_val = valuation_engine.calculate_ev_ebitda(
-            ev=val_inputs.get("ev"),
-            ebitda=val_inputs.get("ebitda")
-        )
-        
-        fcf_series = val_inputs.get("fcf_series")
-        latest_fcf = None
-        if isinstance(fcf_series, pd.Series) and not fcf_series.dropna().empty:
-            latest_fcf = float(fcf_series.dropna().iloc[-1])
-        p_fcf_val = valuation_engine.calculate_price_to_fcf(
-            market_cap=val_inputs.get("market_cap"),
-            fcf=latest_fcf
-        )
     else:
         val_inputs = {}
         dcf_val = None
-        graham_val = None
-        graham_num = None
-        gordon_val = None
-        peg_val = None
-        ev_ebitda_val = None
-        p_fcf_val = None
 
     # Compute risks and recommendation
     risks = risk_detector.detect_risks(enriched_metrics or {}, val_inputs, comparison_data)
-    
-    valuations_dict = {
-        "dcf": dcf_val,
-        "graham": graham_val,
-        "graham_number": graham_num,
-        "gordon": gordon_val,
-    }
-    relative_vals = {
-        "peg": peg_val,
-        "ev_ebitda": ev_ebitda_val,
-        "p_fcf": p_fcf_val
-    }
-    
     rec_result = recommendation_engine.generate_recommendation(
         current_price=current_price,
-        valuations=valuations_dict,
-        relative_valuations=relative_vals,
-        risks=risks
+        dcf_val=dcf_val,
+        risks=risks,
     )
+
     
     rec_decision = rec_result["recommendation"]
     justification = rec_result["justification"]
     valuation_status = rec_result["valuation_status"]
-    relative_interpretation = rec_result["relative_interpretation"]
+    
+    # Obtain formatted latest performance metrics for reporting
+    latest_summary = metrics_engine.format_latest_metrics_summary(enriched_metrics or {})
+    annual_metrics = latest_summary.get('annual', {})
     
     vals_for_display = {
         "dcf": dcf_val,
-        "graham": graham_val,
-        "graham_number": graham_num,
-        "gordon": gordon_val,
         "market_price": current_price,
         "valuation_status": valuation_status,
-        "peg": peg_val,
-        "ev_ebitda": ev_ebitda_val,
-        "p_fcf": p_fcf_val,
-        "relative_interpretation": relative_interpretation
+        # Key performance metrics
+        "revenue_growth_yoy": annual_metrics.get('revenue_growth_yoy'),
+        "ebit_margin": annual_metrics.get('ebit_margin'),
+        "net_profit_margin": annual_metrics.get('net_profit_margin'),
+        "roe": annual_metrics.get('roe'),
+        "free_cash_flow": annual_metrics.get('free_cash_flow'),
+        "fcf_margin": annual_metrics.get('fcf_margin'),
     }
     
-    # Generate the PDF report
-    news = metadata.get("news", []) or []
+
+    
+    # (Placeholder) PDF generation will be moved after LLM commentary
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    
+    # Build concise analyst commentary adhering to style guidelines
+    # Valuation phrasing based on status
+    if valuation_status == "Undervalued":
+        valuation_phrase = "trades below its intrinsic value"
+    elif valuation_status == "Overvalued":
+        valuation_phrase = "trades above its intrinsic value"
+    else:
+        valuation_phrase = "appears fairly valued"
+    # Compose 3–5 sentence paragraph without metric lists or repetition
+    llm_commentary = (
+        f"{target_ticker} shows limited growth and thin margins, indicating competitive pressure. "
+        f"Its cash‑flow generation is modest, constraining financial flexibility. "
+        f"The DCF assessment {valuation_phrase}, and with {len(risks)} risk factor(s) identified, a cautious stance is advisable."
+    )
+    # ------- STOCK OVERVIEW -------
+    # Build a concise overview for console output
+    overview_lines = []
+    overview_lines.append(f"STOCK OVERVIEW: {target_ticker}")
+    # Market position (simple placeholder based on revenue relative to peers)
+    try:
+        peer_revenues = [comp['revenue'] for comp in comparison_data.values() if isinstance(comp.get('revenue'), (int, float))]
+        company_rev = vals_for_display.get('revenue') or 0
+        if peer_revenues:
+            median_rev = sorted(peer_revenues)[len(peer_revenues)//2]
+            position = "above" if company_rev > median_rev else "below" if company_rev < median_rev else "on par with"
+            overview_lines.append(f"Market position: {position} peers (revenue)")
+    except Exception:
+        overview_lines.append("Market position: N/A")
+    # Growth standing (YoY revenue growth)
+    yoy = vals_for_display.get('revenue_growth_yoy')
+    if isinstance(yoy, (int, float)):
+        growth = "high" if yoy > 15 else "moderate" if yoy > 5 else "low"
+        overview_lines.append(f"Growth standing: {growth} YoY ({yoy:.2f}%)")
+    else:
+        overview_lines.append("Growth standing: N/A")
+    # Profitability (EBIT margin)
+    ebit_margin = vals_for_display.get('ebit_margin')
+    if isinstance(ebit_margin, (int, float)):
+        profitability = "high" if ebit_margin > 30 else "moderate" if ebit_margin > 15 else "low"
+        overview_lines.append(f"Profitability: {profitability} EBIT margin ({ebit_margin:.2f}%)")
+    else:
+        overview_lines.append("Profitability: N/A")
+    # Efficiency (ROE)
+    roe = vals_for_display.get('roe')
+    if isinstance(roe, (int, float)):
+        efficiency = "high" if roe > 20 else "moderate" if roe > 10 else "low"
+        overview_lines.append(f"Efficiency: {efficiency} ROE ({roe:.2f}%)")
+    else:
+        overview_lines.append("Efficiency: N/A")
+    # Cash flow strength
+    fcf = vals_for_display.get('free_cash_flow')
+    fcf_margin = vals_for_display.get('fcf_margin')
+    if isinstance(fcf_margin, (int, float)):
+        cash_strength = "strong" if fcf_margin > 20 else "moderate" if fcf_margin > 10 else "weak"
+        overview_lines.append(f"Cash flow strength: {cash_strength} (FCF margin {fcf_margin:.2f}%)")
+    else:
+        overview_lines.append("Cash flow strength: N/A")
+    # Valuation status
+    overview_lines.append(f"Valuation status: {vals_for_display.get('valuation_status', 'N/A')}")
+
+    # Print the stock overview (max 7 lines)
+    print("\n".join(overview_lines))
+
+    # ------- RECENT COMPANY NEWS -------
+    def get_company_news(company_name: str, limit: int = 5) -> List[str]:
+        """Fetch latest news headlines for a company.
+        Tries NewsAPI if NEWSAPI_KEY env var is set, otherwise falls back to a simple RSS Google News feed.
+        Returns a list of headline strings.
+        """
+        api_key = os.getenv('NEWSAPI_KEY')
+        headers = {}
+        if api_key:
+            try:
+                url = "https://newsapi.org/v2/everything"
+                params = {
+                    'q': company_name,
+                    'pageSize': limit,
+                    'sortBy': 'publishedAt',
+                    'apiKey': api_key,
+                }
+                resp = requests.get(url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return [article.get('title', '') for article in data.get('articles', [])][:limit]
+            except Exception as e:
+                logger.warning(f"NewsAPI request failed: {e}")
+        # Fallback: RSS feed via Google News
+        try:
+            rss_url = f"https://news.google.com/rss/search?q={company_name.replace(' ', '+')}"
+            resp = requests.get(rss_url, timeout=10)
+            if resp.status_code == 200:
+                # Very simple extraction without external libs
+                import re
+                titles = re.findall(r"<title>(.*?)</title>", resp.text)
+                # First title is the feed title, skip it
+                return [t for t in titles[1:limit+1] if t]
+        except Exception as e:
+            logger.warning(f"RSS news fetch failed: {e}")
+        return []
+
+    news_headlines = get_company_news(target_ticker)
+    if news_headlines:
+        print("\nRECENT COMPANY NEWS:")
+        for hl in news_headlines:
+            print(f"- {hl}")
+    else:
+        print("\nRECENT COMPANY NEWS: No recent headlines found.")
+
+    # ------- FULL FINANCIAL REPORT (PDF) -------
+    # Placeholder for moved PDF generation
+
+    # Generate LLM commentary before PDF generation
+    llm_commentary = ""
+    # Try using Gemini first
+    if HAS_GEMINI and gemini_key:
+        logger.info("Generating report commentary using Gemini LLM...")
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            prompt = construct_prompt(target_ticker, comparison_data, vals_for_display, risks, rec_decision, justification)
+            response = model.generate_content(prompt)
+            llm_commentary = response.text
+        except Exception as e:
+            logger.error(f"Failed to generate report via Gemini: {e}")
+    # Try using OpenAI second
+    if not llm_commentary and HAS_OPENAI and openai_key:
+        logger.info("Generating report commentary using OpenAI LLM...")
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+            prompt = construct_prompt(target_ticker, comparison_data, vals_for_display, risks, rec_decision, justification)
+            response = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}])
+            llm_commentary = response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Failed to generate report via OpenAI: {e}")
+    # Fallback deterministic commentary if LLM APIs unavailable or failed
+    if not llm_commentary:
+        try:
+            from pdf_report import generate_llm_output
+            llm_commentary = generate_llm_output(vals_for_display, risks, rec_decision, comparison_data)
+        except Exception as e:
+            logger.error(f"Failed to generate deterministic LLM commentary: {e}")
+
+    # Generate the PDF report, now including LLM commentary
     pdf_path = pdf_report.generate_pdf_report(
         ticker=target_ticker,
         comparison=comparison_data,
@@ -331,99 +403,15 @@ def generate_financial_report(target_ticker: str, comparison_data: Dict[str, Any
         risks=risks,
         recommendation=rec_decision,
         justification=justification,
-        news=news
+        news=metadata.get("news", []) or [],
+        llm_commentary=llm_commentary
     )
 
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    
-    llm_commentary = ""
-    
-    # Try using Gemini first
-    if HAS_GEMINI and gemini_key:
-        logger.info("Generating report commentary using Gemini LLM...")
-        try:
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            
-            prompt = construct_prompt(target_ticker, comparison_data, vals_for_display, risks, rec_decision, justification)
-            response = model.generate_content(prompt)
-            llm_commentary = response.text
-        except Exception as e:
-            logger.error(f"Failed to generate report via Gemini: {e}")
-            
-    # Try using OpenAI second
-    if not llm_commentary and HAS_OPENAI and openai_key:
-        logger.info("Generating report commentary using OpenAI LLM...")
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=openai_key)
-            
-            prompt = construct_prompt(target_ticker, comparison_data, vals_for_display, risks, rec_decision, justification)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a professional financial analyst. Write structured, concise financial reports with no fluff."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            llm_commentary = response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Failed to generate report via OpenAI: {e}")
-            
-    if llm_commentary:
-        # Construct the final report combining LLM commentary (Sections 1-3) and deterministic sections (4-7)
-        # Ensure LLM did not try to output sections 4-7
-        clean_commentary = llm_commentary.split("4. VALUATION SUMMARY")[0].split("4. Valuation Summary")[0]
-        
-        report_lines = [
-            f"==================================================================",
-            f"FINANCIAL ANALYSIS REPORT: {target_ticker}",
-            f"==================================================================",
-            "",
-            clean_commentary.strip(),
-            "",
-            "4. VALUATION SUMMARY",
-            f"   - DCF Estimated Value: " + (f"${dcf_val:,.2f}" if isinstance(dcf_val, (int, float)) else "N/A"),
-            f"   - Graham Formula Value: " + (f"${graham_val:,.2f}" if isinstance(graham_val, (int, float)) else "N/A"),
-            f"   - Graham Number: " + (f"${graham_num:,.2f}" if isinstance(graham_num, (int, float)) else "N/A"),
-            f"   - Market Price: " + (f"${current_price:,.2f}" if isinstance(current_price, (int, float)) else "N/A"),
-            f"   - Valuation Status: {valuation_status}",
-            "",
-            "5. RELATIVE VALUATION",
-            f"   - PEG Ratio: " + (f"{peg_val:.2f}" if isinstance(peg_val, (int, float)) else "N/A"),
-            f"   - EV/EBITDA: " + (f"{ev_ebitda_val:.2f}" if isinstance(ev_ebitda_val, (int, float)) else "N/A"),
-            f"   - Price-to-Free-Cash-Flow (P/FCF): " + (f"{p_fcf_val:.2f}" if isinstance(p_fcf_val, (int, float)) else "N/A"),
-            f"   - Short interpretation: {relative_interpretation}",
-            "",
-            "6. RISK ANALYSIS",
-        ]
-        if risks:
-            for r in risks:
-                report_lines.append(f"   - {r}")
-        else:
-            report_lines.append("   - No significant financial risks detected.")
-        report_lines.extend([
-            "",
-            "7. FINAL RECOMMENDATION",
-            f"   - Recommendation: {rec_decision}",
-            f"   - Justification: {justification}",
-            "",
-            f"Note: PDF report has been generated at: {pdf_path}",
-            ""
-        ])
-        return "\n".join(report_lines)
-            
-    # Fallback if no LLM APIs configured or they failed
-    return generate_fallback_report(
-        target_ticker=target_ticker,
-        comparison_data=comparison_data,
-        vals_for_display=vals_for_display,
-        risks=risks,
-        recommendation=rec_decision,
-        justification=justification,
-        pdf_path=pdf_path
-    )
+    # Optionally print LLM output for console
+    print("\nLLM OUTPUT:\n")
+    print(llm_commentary if llm_commentary else "No LLM commentary generated.")
+
+    return pdf_path
 
 def construct_prompt(
     target_ticker: str,
@@ -462,14 +450,8 @@ CRITICAL INSTRUCTIONS:
 
 --- DETECTED METRICS AND VALUATION SUMMARY (FOR CONTEXT) ---
 - DCF Estimated Value: {vals_for_display.get('dcf')}
-- Graham Formula Value: {vals_for_display.get('graham')}
-- Graham Number: {vals_for_display.get('graham_number')}
 - Market Price: {vals_for_display.get('market_price')}
 - Valuation Status: {vals_for_display.get('valuation_status')}
-- PEG Ratio: {vals_for_display.get('peg')}
-- EV/EBITDA: {vals_for_display.get('ev_ebitda')}
-- Price/FCF: {vals_for_display.get('p_fcf')}
-- Short Interpretation: {vals_for_display.get('relative_interpretation')}
 - Financial Risks Detected: {risks}
 
 Please structure the output as follows:
