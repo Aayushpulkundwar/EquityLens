@@ -208,20 +208,48 @@ def generate_financial_report(target_ticker: str, comparison_data: Dict[str, Any
     # Compute valuations
     if enriched_metrics:
         val_inputs = valuation_engine.prepare_valuation_inputs(metadata, enriched_metrics)
-        dcf_val = valuation_engine.dcf_valuation(val_inputs.get("fcf_series"))
-        shares = info.get("sharesOutstanding")
-        if dcf_val is not None and shares and shares > 0:
-            dcf_val = dcf_val / shares
+        # dcf_valuation now returns a dict with detailed results
+        dcf_result = valuation_engine.dcf_valuation(
+            fcf=val_inputs.get("fcf_series"),
+            shares_outstanding=val_inputs.get("shares_outstanding"),
+        )
+        # Extract intrinsic per‑share value
+        dcf_val = dcf_result.get("intrinsic_per_share")
+        # Capture sanity flag if any (e.g., negative intrinsic value)
+        sanity_flag = dcf_result.get("sanity_flag")
+        # Compute valuation gap % if market price is available
+        if dcf_val is not None and current_price:
+            try:
+                valuation_gap = ((dcf_val - current_price) / current_price) * 100
+            except Exception:
+                valuation_gap = None
+        else:
+            valuation_gap = None
+        # Store additional fields for reporting
+        # (We'll add them to vals_for_display later)
     else:
         val_inputs = {}
         dcf_val = None
+        sanity_flag = None
+        valuation_gap = None
+
 
     # Compute risks and recommendation
     risks = risk_detector.detect_risks(enriched_metrics or {}, val_inputs, comparison_data)
+    # Obtain formatted latest performance metrics for reporting
+    latest_summary = metrics_engine.format_latest_metrics_summary(enriched_metrics or {})
+    annual_metrics = latest_summary.get('annual', {})
+    # Derive fundamental indicators for recommendation engine
+    growth_vs_peers = "outperforming" if isinstance(annual_metrics.get('revenue_growth_yoy'), (int, float)) and annual_metrics.get('revenue_growth_yoy') > 0 else "underperforming"
+    profitability_vs_peers = "outperforming" if isinstance(annual_metrics.get('ebit_margin'), (int, float)) and annual_metrics.get('ebit_margin') > 0 else "underperforming"
+    fcf_positive = bool(annual_metrics.get('free_cash_flow') and annual_metrics.get('free_cash_flow') > 0)
     rec_result = recommendation_engine.generate_recommendation(
         current_price=current_price,
         dcf_val=dcf_val,
         risks=risks,
+        growth_vs_peers=growth_vs_peers,
+        profitability_vs_peers=profitability_vs_peers,
+        fcf_positive=fcf_positive,
     )
 
     
@@ -395,7 +423,11 @@ def generate_financial_report(target_ticker: str, comparison_data: Dict[str, Any
         except Exception as e:
             logger.error(f"Failed to generate deterministic LLM commentary: {e}")
 
-    # Generate the PDF report, now including LLM commentary
+    # Generate Company Overview
+    raw_desc = metadata.get("info", {}).get("longBusinessSummary", "")
+    company_overview = generate_company_overview(target_ticker, raw_desc)
+
+    # Generate the PDF report, now including LLM commentary and Company Overview
     pdf_path = pdf_report.generate_pdf_report(
         ticker=target_ticker,
         comparison=comparison_data,
@@ -404,11 +436,12 @@ def generate_financial_report(target_ticker: str, comparison_data: Dict[str, Any
         recommendation=rec_decision,
         justification=justification,
         news=metadata.get("news", []) or [],
-        llm_commentary=llm_commentary
+        llm_commentary=llm_commentary,
+        company_overview=company_overview
     )
 
-    # Optionally print LLM output for console
-    print("\nLLM OUTPUT:\n")
+    # Optionally print Executive Summary for console
+    print("\nEXECUTIVE SUMMARY:\n")
     print(llm_commentary if llm_commentary else "No LLM commentary generated.")
 
     return pdf_path
@@ -460,3 +493,104 @@ Please structure the output as follows:
 3. PEER COMPARISON SUMMARY: Strengths and weaknesses relative to the peer group.
 """
     return prompt
+
+def generate_company_overview(ticker: str, raw_description: str) -> str:
+    """
+    Generates a professional Company Overview (30-40 lines) using an LLM if keys are available,
+    otherwise falling back to a high-quality pre-written or parsed version.
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    
+    if not raw_description:
+        try:
+            import yfinance as yf
+            ticker_obj = yf.Ticker(ticker)
+            raw_description = ticker_obj.info.get("longBusinessSummary", "")
+        except Exception:
+            raw_description = ""
+
+    prompt = f"""
+You are a senior financial analyst. Generate a professional "Company Overview" as the first section of the report for {ticker}.
+
+INPUT:
+{raw_description or 'No raw description available.'}
+
+OUTPUT REQUIREMENTS:
+- 30-40 lines only
+- Clear and structured (use 3-4 paragraphs)
+- Explain:
+   • What the company does
+   • Key products/services
+   • Industry positioning
+- No financial metrics (no revenue figures, margin percentages, price points, growth rates, etc.)
+- No repetition
+- Institutional tone (like DBS report)
+
+STYLE:
+Concise, formal, analyst-grade writing.
+
+Return only the paragraphs.
+"""
+    
+    # Try using Gemini first
+    if HAS_GEMINI and gemini_key:
+        logger.info("Generating company overview using Gemini LLM...")
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate company overview via Gemini: {e}")
+            
+    # Try using OpenAI second
+    if HAS_OPENAI and openai_key:
+        logger.info("Generating company overview using OpenAI LLM...")
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate company overview via OpenAI: {e}")
+
+    # Fallback to high-quality pre-written overviews for common tickers
+    ticker_upper = ticker.strip().upper()
+    if ticker_upper == "NVDA":
+        return """NVIDIA Corporation (the "Company") operates as a global pioneer and dominant provider of accelerated computing hardware, software, and systems infrastructure. The Company specializes in the design, development, and integration of graphics processing units (GPUs), central processing units (CPUs), network interface cards, and high-performance computing systems. Its core operations are divided into two main reporting segments: Compute & Networking, and Graphics.
+
+Through these segments, the Company offers a comprehensive suite of hardware and software products tailored for highly demanding computing environments. Key offerings include the proprietary CUDA programming model and acceleration libraries, GeForce GPUs for high-end consumer PC gaming, NVIDIA RTX GPUs for professional enterprise workstation visualization, and advanced Hopper and Blackwell architecture-based platforms for hyperscale data centers. Additionally, the Company designs automotive hardware and software platforms under the Drive brand, facilitating advanced driver assistance systems and autonomous driving technologies.
+
+The Company occupies a highly strategic and critical position within the global technology value chain. It has transitioned from a specialized graphics component vendor into a full-stack, data center-scale accelerated computing platform provider. This unique positioning makes the Company the foundational infrastructure supplier for hyperscaler cloud service providers, enterprise software companies, scientific research organizations, and autonomous vehicle developers. By combining proprietary silicon architectures with a deeply entrenched software ecosystem, the Company maintains a high barrier to entry and remains the primary driver of computational advancements in artificial intelligence and deep learning technologies.
+
+Its customer base spans original equipment manufacturers, cloud service providers, independent software vendors, and automotive manufacturers, establishing a diversified footprint across multiple high-growth vertical markets. The integration of its hardware solutions with software platforms secures long-term developer lock-in and reinforces its market-leading position. Furthermore, its commitment to continuous engineering development through custom silicon solutions enables the enterprise client base to optimize computing workflows across hybrid and public cloud architectures, cementing its status as an indispensable sector leader."""
+    elif ticker_upper == "AAPL":
+        return """Apple Inc. (the "Company") is a global technology design leader and consumer electronics pioneer that designs, manufactures, and markets mobile communication devices, personal computers, tablets, wearables, and accessories. The Company also licenses and sells a highly profitable portfolio of related software, services, and digital content. Its major product categories include the iPhone, Mac personal computers, the iPad family, and wearable devices like the Apple Watch and AirPods.
+
+The Company operates in a highly competitive market, positioning itself as a premium provider by emphasizing seamless hardware-software integration. Key services such as the App Store, iCloud, Apple Music, Apple Pay, and subscription platforms serve to lock in users and build a highly loyal ecosystem. This digital software layer generates recurring high-margin revenue and reinforces the hardware value proposition across its global customer base.
+
+By retaining absolute control over its hardware designs, proprietary operating systems, and developer ecosystem, the Company commands exceptional brand equity and premium pricing power. Its industry position is anchored by its role as an ecosystem builder, maintaining strict quality standards and privacy guarantees that differentiate its hardware from commodities. It distributes its products through direct retail stores, online platforms, and third-party cellular carriers and wholesalers, ensuring deep penetration across mature and emerging international markets."""
+    elif ticker_upper == "MSFT":
+        return """Microsoft Corporation (the "Company") is a global technology giant specializing in the development, licensing, and support of software, services, devices, and cloud computing infrastructure. The Company is structured into three primary operating segments: Productivity and Business Processes, Intelligent Cloud, and More Personal Computing. Its portfolio includes the Windows operating system, Office productivity suites, and Azure enterprise cloud platform.
+
+The Company's key offerings span software-as-a-service applications, server platform technologies, enterprise database management, and advanced cloud-based computing architectures. In addition, the Company produces computing hardware under the Surface line and operates a major gaming division encompassing Xbox consoles and developer studios. Its enterprise solutions are designed to facilitate digital transformation and hybrid work environments.
+
+The Company occupies a highly secure and leading position in the enterprise software and global cloud computing industry. Through its Azure platform, the Company serves as a primary hyperscale infrastructure provider, hosting mission-critical applications for global enterprises. Its ubiquitous productivity software and server architectures create high switching costs and deep customer relationships, securing its market position and driving software adoption across public, private, and hybrid cloud networks."""
+    else:
+        # Generic fallback that formats the raw description into a clean 30-40 line corporate summary
+        if not raw_description:
+            raw_description = f"{ticker} is a publicly traded corporation engaged in commercial operations within its respective sector. The company focus includes developing products and delivering services designed to meet specific market demands."
+        
+        sentences = [s.strip() for s in raw_description.replace("\n", " ").split(".") if s.strip()]
+        para1 = " ".join(sentences[:min(len(sentences), 4)])
+        para2 = " ".join(sentences[4:min(len(sentences), 8)]) if len(sentences) > 4 else ""
+        para3 = " ".join(sentences[8:min(len(sentences), 12)]) if len(sentences) > 8 else ""
+        para4 = " ".join(sentences[12:]) if len(sentences) > 12 else ""
+        
+        paragraphs = [p for p in [para1, para2, para3, para4] if p]
+        formatted_overview = "\n\n".join(paragraphs)
+        return formatted_overview

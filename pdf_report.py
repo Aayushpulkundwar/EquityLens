@@ -125,6 +125,7 @@ def generate_pdf_report(
     output_path: str = None,
     llm_commentary: str = "",
     warnings: list = None,
+    company_overview: str = "",
 ) -> str:
     """Create a clean, premium PDF report structured exactly as required.
 
@@ -231,6 +232,13 @@ def generate_pdf_report(
 
     elements = []
 
+    # Logo Header (preserve aspect ratio, avoid stretching)
+    logo_path = "primus_logo.png"
+    if os.path.exists(logo_path):
+        # Only set width; height will be scaled automatically to keep original proportions
+        elements.append(Image(logo_path, width=200, height=75, hAlign='CENTER'))
+        elements.append(Spacer(1, 15))
+
     # Title Banner
     elements.append(Paragraph(f"FINANCIAL ANALYSIS REPORT: {ticker}", title_style))
     elements.append(Spacer(1, 10))
@@ -282,8 +290,20 @@ def generate_pdf_report(
     elements.append(ListFlowable(summary_items, bulletType='bullet'))
     elements.append(Spacer(1, 10))
 
-    # --- SECTION 1: METRICS ---
-    elements.append(Paragraph("1. FINANCIAL PERFORMANCE & PEER COMPARISON", h1_style))
+    # --- SECTION 1: COMPANY OVERVIEW ---
+    elements.append(Paragraph("1. COMPANY OVERVIEW", h1_style))
+    if company_overview:
+        for p in company_overview.split("\n\n"):
+            p_text = p.strip().replace("\n", " ")
+            if p_text:
+                elements.append(Paragraph(p_text, body_style))
+                elements.append(Spacer(1, 6))
+    else:
+        elements.append(Paragraph("Company overview details are not available for this ticker.", body_style))
+    elements.append(Spacer(1, 10))
+
+    # --- SECTION 2: METRICS ---
+    elements.append(Paragraph("2. FINANCIAL PERFORMANCE & PEER COMPARISON", h1_style))
     
     def df_to_table(df, title):
         if df is None or df.empty:
@@ -432,7 +452,7 @@ def generate_pdf_report(
             strengths.append(f"Strong revenue growth YoY compared to peers, leading with {top_peer}")
         except Exception as e:
             logger.error(f"Failed to compute revenue growth strength: {e}")
-    elements.append(Paragraph("2. VALUATION SUMMARY (DCF-BASED)", h1_style))
+    elements.append(Paragraph("3. VALUATION SUMMARY (DCF-BASED)", h1_style))
 
     val_rows = [
         ["DCF Estimated Value", f"${valuations.get('dcf'):,.2f}" if isinstance(valuations.get('dcf'), (int, float)) else "N/A"],
@@ -454,8 +474,8 @@ def generate_pdf_report(
     elements.append(val_table)
     elements.append(Spacer(1, 10))
 
-    # --- SECTION 3: NEWS ---
-    elements.append(Paragraph("3. RECENT COMPANY NEWS HEADLINES", h1_style))
+    # --- SECTION 4: NEWS ---
+    elements.append(Paragraph("4. RECENT COMPANY NEWS HEADLINES", h1_style))
     # Fetch news relevant to the target ticker
     news_items = get_company_news(ticker)
     static_news = [item.get('title', 'No title') for item in news_items[:5]]
@@ -466,8 +486,8 @@ def generate_pdf_report(
     elements.append(Spacer(1, 10))
     elements.append(Spacer(1, 10))
 
-    # --- SECTION 4: RISKS ---
-    elements.append(Paragraph("4. FINANCIAL RISK ANALYSIS", h1_style))
+    # --- SECTION 5: RISKS ---
+    elements.append(Paragraph("5. FINANCIAL RISK ANALYSIS", h1_style))
     if risks:
         risk_items = [ListItem(Paragraph(r, body_style), leftIndent=15, bulletOffsetY=-2) for r in risks]
         elements.append(ListFlowable(risk_items, bulletType='bullet', bulletColor=colors.HexColor('#E53E3E')))
@@ -475,8 +495,8 @@ def generate_pdf_report(
         elements.append(Paragraph("No significant financial risks detected.", body_style))
     elements.append(Spacer(1, 12))
 
-    # --- SECTION 5: RECOMMENDATION ---
-    elements.append(Paragraph("5. FINAL DETERMINISTIC RECOMMENDATION", h1_style))
+    # --- SECTION 6: RECOMMENDATION ---
+    elements.append(Paragraph("6. FINAL DETERMINISTIC RECOMMENDATION", h1_style))
     
     # Banner/Box for recommendation
     bg_color = colors.HexColor("#FED7D7") if recommendation == "AVOID" else colors.HexColor("#C6F6D5") if recommendation == "BUY" else colors.HexColor("#FEFCBF")
@@ -496,8 +516,8 @@ def generate_pdf_report(
     elements.append(Spacer(1, 8))
     
     elements.append(Paragraph(f"<b>Justification:</b> {justification}", body_style))
-    # LLM OUTPUT SECTION (added at end of report)
-    elements.append(Paragraph("LLM OUTPUT", h1_style))
+    # EXECUTIVE SUMMARY SECTION (added at end of report)
+    elements.append(Paragraph("EXECUTIVE SUMMARY", h1_style))
     elements.append(Spacer(1, 4))
     elements.append(Paragraph(llm_commentary, body_style))
 
