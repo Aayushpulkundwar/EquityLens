@@ -203,6 +203,9 @@ def generate_financial_report(target_ticker: str, comparison_data: Dict[str, Any
             h = t.history(period="1d")
             if not h.empty:
                 current_price = float(h['Close'].iloc[-1])
+                if data_fetcher.is_ns_nse_stock(target_ticker):
+                    rate = data_fetcher.get_usd_inr_rate()
+                    current_price = current_price / rate
         except Exception:
             current_price = None
     # Compute valuations

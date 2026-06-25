@@ -1,8 +1,28 @@
 import yfinance as yf
 import logging
+import pandas as pd
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
+
+def is_ns_nse_stock(ticker_symbol: str) -> bool:
+    """Check if the ticker ends with NS or NSE."""
+    t = ticker_symbol.strip().upper()
+    return t.endswith(".NS") or t.endswith(".NSE") or t.endswith("NS") or t.endswith("NSE")
+
+def get_usd_inr_rate() -> float:
+    """Fetch USD/INR exchange rate dynamically, fallback to 83.5 if offline/fails."""
+    try:
+        ticker = yf.Ticker("USDINR=X")
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            rate = hist['Close'].iloc[-1]
+            if rate > 0:
+                logger.info(f"Fetched dynamic USDINR exchange rate: {rate}")
+                return float(rate)
+    except Exception as e:
+        logger.warning(f"Failed to fetch USDINR=X rate from yfinance: {e}")
+    return 83.5
 
 def fetch_financial_data(ticker_symbol: str) -> Optional[Dict[str, Any]]:
     """Fetch financial statements for a ticker using yfinance.
@@ -35,6 +55,16 @@ def fetch_financial_data(ticker_symbol: str) -> Optional[Dict[str, Any]]:
         if all(df is None or df.empty for df in data.values()):
             logger.warning(f"No financial data retrieved for {ticker_symbol}")
             return None
+
+        # Convert to USD if it is an NS or NSE stock
+        if is_ns_nse_stock(ticker_symbol):
+            rate = get_usd_inr_rate()
+            logger.info(f"Converting financial statement data to dollars for {ticker_symbol} using rate {rate}")
+            for key, df in data.items():
+                if df is not None and not df.empty:
+                    for col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce') / rate
+
         return data
     except Exception as e:
         logger.error(f"Error fetching financial data for {ticker_symbol}: {e}")
@@ -75,6 +105,42 @@ def fetch_ticker_metadata(ticker_symbol: str) -> Optional[Dict[str, Any]]:
             dividends = ticker.dividends
         except Exception as e:
             logger.warning(f"Dividends fetch error for {ticker_symbol}: {e}")
+        # Convert metadata values to USD if it is an NS or NSE stock
+        if is_ns_nse_stock(ticker_symbol):
+            rate = get_usd_inr_rate()
+            logger.info(f"Converting metadata to dollars for {ticker_symbol} using rate {rate}")
+            # Convert info dictionary
+            new_info = info.copy()
+            for curr_key in ["currency", "financialCurrency"]:
+                if curr_key in new_info:
+                    new_info[curr_key] = "USD"
+            
+            monetary_keys = {
+                "open", "previousClose", "dayHigh", "dayLow", "bid", "ask", 
+                "dividendRate", "trailingAnnualDividendRate", "marketCap", 
+                "totalRevenue", "ebitda", "operatingCashflow", "freeCashflow", 
+                "totalDebt", "totalCash", "grossProfits", "netIncomeToCommon", 
+                "revenuePerShare", "bookValue"
+            }
+            
+            for key, val in new_info.items():
+                if isinstance(val, (int, float)):
+                    is_monetary = (
+                        key in monetary_keys or
+                        key.endswith("Price") or
+                        key.endswith("Value") or
+                        key.endswith("Average") or
+                        key.endswith("High") or
+                        key.endswith("Low")
+                    )
+                    if is_monetary:
+                        new_info[key] = val / rate
+            info = new_info
+
+            # Convert dividends Series
+            if dividends is not None and not dividends.empty:
+                dividends = dividends / rate
+
         result: Dict[str, Any] = {"info": info, "news": structured_news}
         if dividends is not None:
             result["dividends"] = dividends

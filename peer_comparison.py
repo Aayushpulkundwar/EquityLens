@@ -18,7 +18,10 @@ PEER_MAPPING = {
     "META": ["GOOGL", "AAPL", "NFLX"],
     "TSLA": ["F", "GM", "TM"],
     "NVDA": ["AMD", "INTC", "QCOM"],
-    "AMD": ["NVDA", "INTC", "QCOM"]
+    "AMD": ["NVDA", "INTC", "QCOM"],
+    "RELIANCE.NS": ["IOC.NS", "BPCL.NS", "HINDPETRO.NS"],
+    "TCS.NS": ["INFY.NS", "WIPRO.NS", "HCLTECH.NS"],
+    "INFY.NS": ["TCS.NS", "WIPRO.NS", "HCLTECH.NS"]
 }
 
 def get_peers_for_ticker(ticker: str) -> List[str]:
